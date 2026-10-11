@@ -37,6 +37,20 @@ pub fn start() {
                     } else if q.contains("sample") {
                         let _ = session.execute("file.new", serde_json::json!({"sample": "sales"}));
                     }
+                    if let Some(url) = q.split(['?', '&']).find_map(|kv| kv.strip_prefix("open=")).map(str::to_owned) {
+                        let ctx = cc.egui_ctx.clone();
+                        let inbox = inbox.clone();
+                        wasm_bindgen_futures::spawn_local(async move {
+                            match fetch_workbook(&url).await {
+                                Ok((name, bytes)) => {
+                                    log::info!("opening {url} as {name}");
+                                    inbox.lock().unwrap_or_else(|e| e.into_inner()).push((name, bytes));
+                                    ctx.request_repaint();
+                                }
+                                Err(e) => log::error!("couldn't open {url}: {e}"),
+                            }
+                        });
+                    }
                     let mut app = SheetApp::new(session, services(inbox.clone(), cc.egui_ctx.clone()));
                     // Follow the browser's language, except a CJK one: the web build has no system
                     // CJK fonts (none are bundled), so that interface would render as tofu.
@@ -144,6 +158,24 @@ fn services(inbox: Inbox, ctx: egui::Context) -> Services {
         inbox: Some(inbox),
         ..Default::default()
     }
+}
+
+/// Fetches the workbook named by the `?open=` query flag (same-origin or CORS-permitted URL) and
+/// returns its file name and bytes for the inbox, as if it had been picked or dropped.
+async fn fetch_workbook(url: &str) -> Result<(String, Vec<u8>), String> {
+    let js = |e: wasm_bindgen::JsValue| format!("{e:?}");
+    let window = web_sys::window().ok_or("no window")?;
+    let response = wasm_bindgen_futures::JsFuture::from(window.fetch_with_str(url))
+        .await
+        .map_err(js)?
+        .dyn_into::<web_sys::Response>()
+        .map_err(|_| "fetch did not return a Response".to_string())?;
+    if !response.ok() {
+        return Err(format!("HTTP {} for {url}", response.status()));
+    }
+    let buffer = wasm_bindgen_futures::JsFuture::from(response.array_buffer().map_err(js)?).await.map_err(js)?;
+    let name = url.split(['?', '#']).next().unwrap_or("workbook.xlsx").rsplit('/').find(|s| !s.is_empty()).unwrap_or("workbook.xlsx");
+    Ok((name.to_string(), js_sys::Uint8Array::new(&buffer).to_vec()))
 }
 
 /// Start inside the copy gesture; deferring `write` can lose browser user activation.
