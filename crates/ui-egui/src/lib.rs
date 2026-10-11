@@ -11,6 +11,7 @@ pub mod control;
 pub mod credits;
 pub mod dialogs;
 pub mod editor;
+pub mod fonts;
 pub mod formula_bar;
 pub mod grid;
 pub mod icons;

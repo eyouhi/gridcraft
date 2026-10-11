@@ -115,6 +115,11 @@ cd apps/gridcraft-web && trunk serve --release     # http://127.0.0.1:8771  (?sa
 You need [trunk](https://trunkrs.dev) and the `wasm32-unknown-unknown` target. Open uses the
 browser's file picker (dropping files works too) and Save downloads the workbook.
 
+CJK text in the browser needs the optional craft-fonts input — wasm can't read system fonts:
+build with `CRAFT_FONTS_DIR=$PWD/../../craft-fonts` (a [craft-fonts](https://github.com/storytold/craft-fonts)
+checkout next to this repo) to embed Noto Sans CJK SC in the wasm (~16 MB); without it Chinese
+renders as tofu boxes. `?open=<url>` (same site) opens a workbook straight from the URL.
+
 ## For agents: MCP, CLI and the control channel
 
 ```sh

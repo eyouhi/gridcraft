@@ -37,6 +37,9 @@ pub fn start() {
                     } else if q.contains("sample") {
                         let _ = session.execute("file.new", serde_json::json!({"sample": "sales"}));
                     }
+                    if let Some(url) = q.split(['?', '&']).find_map(|kv| kv.strip_prefix("open=")).filter(|u| !u.is_empty()) {
+                        open_url(url, inbox.clone(), cc.egui_ctx.clone());
+                    }
                     let app = SheetApp::new(session, services(inbox.clone(), cc.egui_ctx.clone()));
                     SheetApp::setup_context(&cc.egui_ctx, false);
                     Ok(Box::new(WebShell { app, inbox }))
@@ -54,6 +57,41 @@ pub fn start() {
 
 fn query() -> String {
     web_sys::window().and_then(|w| w.location().search().ok()).unwrap_or_default()
+}
+
+/// `?open=<url>`: fetch a workbook and deliver it through the inbox, like a dropped file.
+fn open_url(url: &str, inbox: Inbox, ctx: egui::Context) {
+    let url = url.to_string();
+    wasm_bindgen_futures::spawn_local(async move {
+        match fetch_bytes(&url).await {
+            Ok(bytes) => {
+                inbox.lock().unwrap_or_else(|e| e.into_inner()).push((file_name(&url), bytes));
+                ctx.request_repaint();
+            }
+            Err(e) => log::error!("couldn't open {url}: {e}"),
+        }
+    });
+}
+
+/// Fetches a same-origin (or CORS-enabled) URL into memory.
+async fn fetch_bytes(url: &str) -> Result<Vec<u8>, String> {
+    let window = web_sys::window().ok_or("no window")?;
+    let resp = wasm_bindgen_futures::JsFuture::from(window.fetch_with_str(url)).await.map_err(|e| format!("{e:?}"))?;
+    let resp: web_sys::Response = resp.dyn_into().map_err(|_| "not a response".to_string())?;
+    if !resp.ok() {
+        return Err(format!("HTTP {} for {url}", resp.status()));
+    }
+    let buffer = wasm_bindgen_futures::JsFuture::from(resp.array_buffer().map_err(|e| format!("{e:?}"))?).await.map_err(|e| format!("{e:?}"))?;
+    Ok(js_sys::Uint8Array::new(&buffer).to_vec())
+}
+
+/// The last path segment of `url`, percent-decoded; the name the workbook opens under.
+fn file_name(url: &str) -> String {
+    let path = url.split(['?', '#']).next().unwrap_or(url);
+    match path.rsplit('/').next().filter(|s| !s.is_empty()) {
+        Some(raw) => js_sys::decode_uri_component(raw).ok().and_then(|s| s.as_string()).unwrap_or_else(|| raw.to_string()),
+        None => "opened.xlsx".into(),
+    }
 }
 
 struct WebShell {

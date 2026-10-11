@@ -9,6 +9,8 @@ use std::sync::Arc;
 
 use egui::{Color32, FontData, FontDefinitions, FontFamily, FontId, Stroke, Visuals};
 
+use crate::fonts as craft;
+
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Tokens {
     pub dark: bool,
@@ -332,6 +334,10 @@ pub fn font_definitions() -> FontDefinitions {
     let base_mono: Vec<String> = fonts.families.get(&FontFamily::Monospace).cloned().unwrap_or_default();
     let cjk = add_cjk(&mut fonts, false);
     let cjk_bold = add_cjk(&mut fonts, true).or(cjk);
+    // Optional craft-fonts build input: register the embedded faces before any chain refers to them.
+    for (i, f) in craft::CRAFT_FONTS.iter().enumerate() {
+        fonts.font_data.insert(craft::key(i), Arc::new(FontData::from_static(f.bytes)));
+    }
     for role in [UI, UI_BOLD, CELL, CELL_BOLD, CELL_ITALIC, CELL_BOLD_ITALIC, SERIF, MONO] {
         let paths = candidates(role);
         let refs: Vec<(&str, u32)> = paths.iter().map(|(p, i)| (p.as_str(), *i)).collect();
@@ -352,6 +358,10 @@ pub fn font_definitions() -> FontDefinitions {
         if let Some(key) = cjk_key {
             chain.push(key.to_string());
         }
+        // craft-fonts last of all: faces for scripts no font on hand covers — in the browser,
+        // where the system-CJK fallback above can never load, that is every CJK face. A no-op
+        // unless the build sets CRAFT_FONTS_DIR.
+        chain.extend(craft::fallbacks(matches!(role, UI_BOLD | CELL_BOLD | CELL_BOLD_ITALIC)));
         fonts.families.insert(FontFamily::Name(role.into()), chain);
     }
     // Default proportional text in widgets uses the UI font.
@@ -414,7 +424,46 @@ mod tests {
         for role in [UI, UI_BOLD, CELL, CELL_BOLD, CELL_ITALIC, CELL_BOLD_ITALIC, SERIF, MONO] {
             let chain = chain(&fonts, role);
             let last = chain.last().map(String::as_str);
-            assert!(matches!(last, Some("sys-cjk" | "sys-cjk-bold")), "{role} chain: {chain:?}");
+            let embedded = last.is_some_and(|k| k.starts_with("craft-font-"));
+            assert!(embedded || matches!(last, Some("sys-cjk" | "sys-cjk-bold")), "{role} chain: {chain:?}");
+        }
+    }
+
+    /// Built with `CRAFT_FONTS_DIR`, every family ends with the embedded faces — the browser's
+    /// only CJK fallback. Skipped when the build has no craft-fonts input.
+    #[test]
+    fn embedded_craft_fonts_end_every_family() {
+        if craft::is_empty() {
+            return;
+        }
+        let fonts = font_definitions();
+        for (role, bold) in [(UI, false), (UI_BOLD, true), (CELL, false), (MONO, false)] {
+            let chain = chain(&fonts, role);
+            let expected = craft::fallbacks(bold);
+            let tail = chain[chain.len().saturating_sub(expected.len())..].to_vec();
+            assert_eq!(tail, expected, "{role} chain: {chain:?}");
+        }
+        assert_eq!(fonts.families[&FontFamily::Proportional], chain(&fonts, UI));
+    }
+
+    /// Built with `CRAFT_FONTS_DIR`, Han text is actually covered — the whole point in the
+    /// browser, where the system-CJK fallback can never load.
+    #[test]
+    fn embedded_craft_fonts_cover_han_text() {
+        if craft::is_empty() {
+            return;
+        }
+        let ctx = egui::Context::default();
+        ctx.set_fonts(font_definitions());
+        let input = egui::RawInput { screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(800.0, 600.0))), ..Default::default() };
+        // Fonts only exist after a pass; run one before asking what they cover.
+        let mut output = ctx.run_ui(input, |_| {});
+        output.textures_delta.clear();
+        for family in [UI, UI_BOLD, CELL, CELL_BOLD, MONO] {
+            let id = FontId::new(14.0, FontFamily::Name(family.into()));
+            for c in ['中', '保', '物', '模', '型'] {
+                assert!(ctx.fonts_mut(|f| f.has_glyph(&id, c)), "{family} lacks {c:?}");
+            }
         }
     }
 
