@@ -9,7 +9,7 @@
 //! files are read asynchronously.
 //!
 //! URL query flags: `?webgl` forces WebGL2; `?sample=sales|budget|grades` opens a sample;
-//! `?open=<url>` fetches a workbook (same-origin or CORS-enabled) and opens it.
+//! `?open=<url>` fetches a workbook (same-origin or CORS-permitted) and opens it.
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented, clippy::todo, clippy::unreachable)]
 
 #[cfg(target_arch = "wasm32")]

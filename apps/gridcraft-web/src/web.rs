@@ -37,11 +37,34 @@ pub fn start() {
                     } else if q.contains("sample") {
                         let _ = session.execute("file.new", serde_json::json!({"sample": "sales"}));
                     }
-                    if let Some(url) = q.split(['?', '&']).find_map(|kv| kv.strip_prefix("open=")).filter(|u| !u.is_empty()) {
-                        open_url(url, inbox.clone(), cc.egui_ctx.clone());
+                    if let Some(url) = q.split(['?', '&']).find_map(|kv| kv.strip_prefix("open=")).filter(|u| !u.is_empty()).map(str::to_owned) {
+                        let ctx = cc.egui_ctx.clone();
+                        let inbox = inbox.clone();
+                        wasm_bindgen_futures::spawn_local(async move {
+                            match fetch_workbook(&url).await {
+                                Ok((name, bytes)) => {
+                                    log::info!("opening {url} as {name}");
+                                    inbox.lock().unwrap_or_else(|e| e.into_inner()).push((name, bytes));
+                                    ctx.request_repaint();
+                                }
+                                Err(e) => log::error!("couldn't open {url}: {e}"),
+                            }
+                        });
                     }
-                    let app = SheetApp::new(session, services(inbox.clone(), cc.egui_ctx.clone()));
-                    SheetApp::setup_context(&cc.egui_ctx, false);
+                    let mut app = SheetApp::new(session, services(inbox.clone(), cc.egui_ctx.clone()));
+                    // Follow the browser's language, except a CJK one when no CJK faces are
+                    // embedded: the web build has no system fonts, so that interface would render
+                    // as tofu. Built with CRAFT_FONTS_DIR (see the README), the embedded faces
+                    // cover CJK after all.
+                    let browser = gridcraft_ui_egui::i18n::Language::system();
+                    let cjk = matches!(
+                        browser,
+                        gridcraft_ui_egui::i18n::Language::Zh | gridcraft_ui_egui::i18n::Language::Ja | gridcraft_ui_egui::i18n::Language::Ko
+                    );
+                    if !gridcraft_ui_egui::fonts::is_empty() || !cjk {
+                        app.ui.language = browser;
+                    }
+                    SheetApp::setup_context_for_language(&cc.egui_ctx, false, app.ui.language);
                     Ok(Box::new(WebShell { app, inbox }))
                 }),
             )
@@ -57,41 +80,6 @@ pub fn start() {
 
 fn query() -> String {
     web_sys::window().and_then(|w| w.location().search().ok()).unwrap_or_default()
-}
-
-/// `?open=<url>`: fetch a workbook and deliver it through the inbox, like a dropped file.
-fn open_url(url: &str, inbox: Inbox, ctx: egui::Context) {
-    let url = url.to_string();
-    wasm_bindgen_futures::spawn_local(async move {
-        match fetch_bytes(&url).await {
-            Ok(bytes) => {
-                inbox.lock().unwrap_or_else(|e| e.into_inner()).push((file_name(&url), bytes));
-                ctx.request_repaint();
-            }
-            Err(e) => log::error!("couldn't open {url}: {e}"),
-        }
-    });
-}
-
-/// Fetches a same-origin (or CORS-enabled) URL into memory.
-async fn fetch_bytes(url: &str) -> Result<Vec<u8>, String> {
-    let window = web_sys::window().ok_or("no window")?;
-    let resp = wasm_bindgen_futures::JsFuture::from(window.fetch_with_str(url)).await.map_err(|e| format!("{e:?}"))?;
-    let resp: web_sys::Response = resp.dyn_into().map_err(|_| "not a response".to_string())?;
-    if !resp.ok() {
-        return Err(format!("HTTP {} for {url}", resp.status()));
-    }
-    let buffer = wasm_bindgen_futures::JsFuture::from(resp.array_buffer().map_err(|e| format!("{e:?}"))?).await.map_err(|e| format!("{e:?}"))?;
-    Ok(js_sys::Uint8Array::new(&buffer).to_vec())
-}
-
-/// The last path segment of `url`, percent-decoded; the name the workbook opens under.
-fn file_name(url: &str) -> String {
-    let path = url.split(['?', '#']).next().unwrap_or(url);
-    match path.rsplit('/').next().filter(|s| !s.is_empty()) {
-        Some(raw) => js_sys::decode_uri_component(raw).ok().and_then(|s| s.as_string()).unwrap_or_else(|| raw.to_string()),
-        None => "opened.xlsx".into(),
-    }
 }
 
 struct WebShell {
@@ -130,18 +118,33 @@ impl eframe::App for WebShell {
 
 fn services(inbox: Inbox, ctx: egui::Context) -> Services {
     let open_inbox = inbox.clone();
+    let picture_ctx = ctx.clone();
     Services {
+        copy_html: Some(Box::new(copy_html)),
         open_async: Some(Box::new(move || {
             let inbox = open_inbox.clone();
             let ctx = ctx.clone();
             wasm_bindgen_futures::spawn_local(async move {
-                let Some(file) =
-                    rfd::AsyncFileDialog::new().add_filter("Spreadsheets", &["xlsx", "xlsm", "csv", "tsv", "txt", "json"]).pick_file().await
+                let Some(file) = rfd::AsyncFileDialog::new()
+                    .add_filter("Spreadsheets", &["xlsx", "xlsm", "xlsb", "ods", "csv", "tsv", "txt", "json"])
+                    .pick_file()
+                    .await
                 else {
                     return;
                 };
                 let bytes = file.read().await;
                 inbox.lock().unwrap_or_else(|e| e.into_inner()).push((file.file_name(), bytes));
+                ctx.request_repaint();
+            });
+        })),
+        pick_picture_async: Some(Box::new(move |inbox| {
+            let ctx = picture_ctx.clone();
+            wasm_bindgen_futures::spawn_local(async move {
+                let Some(file) = rfd::AsyncFileDialog::new().add_filter("Pictures (PNG, JPEG)", &["png", "jpg", "jpeg"]).pick_file().await else {
+                    return;
+                };
+                let bytes = file.read().await;
+                inbox.lock().unwrap_or_else(std::sync::PoisonError::into_inner).push((file.file_name(), bytes));
                 ctx.request_repaint();
             });
         })),
@@ -158,6 +161,59 @@ fn services(inbox: Inbox, ctx: egui::Context) -> Services {
         inbox: Some(inbox),
         ..Default::default()
     }
+}
+
+/// Fetches the workbook named by the `?open=` query flag (same-origin or CORS-permitted URL) and
+/// returns its file name and bytes for the inbox, as if it had been picked or dropped.
+async fn fetch_workbook(url: &str) -> Result<(String, Vec<u8>), String> {
+    let js = |e: wasm_bindgen::JsValue| format!("{e:?}");
+    let window = web_sys::window().ok_or("no window")?;
+    let response = wasm_bindgen_futures::JsFuture::from(window.fetch_with_str(url))
+        .await
+        .map_err(js)?
+        .dyn_into::<web_sys::Response>()
+        .map_err(|_| "fetch did not return a Response".to_string())?;
+    if !response.ok() {
+        return Err(format!("HTTP {} for {url}", response.status()));
+    }
+    let buffer = wasm_bindgen_futures::JsFuture::from(response.array_buffer().map_err(js)?).await.map_err(js)?;
+    let raw = url.split(['?', '#']).next().unwrap_or("workbook.xlsx").rsplit('/').find(|s| !s.is_empty()).unwrap_or("workbook.xlsx");
+    // Percent-decode, so `?open=my%20book.xlsx` opens as `my book.xlsx`.
+    let name = js_sys::decode_uri_component(raw).ok().and_then(|s| s.as_string()).unwrap_or_else(|| raw.to_string());
+    Ok((name, js_sys::Uint8Array::new(&buffer).to_vec()))
+}
+
+/// Start inside the copy gesture; deferring `write` can lose browser user activation.
+fn copy_html(html: &str, text: &str) -> Result<(), String> {
+    let js = |e: wasm_bindgen::JsValue| format!("{e:?}");
+    let window = web_sys::window().ok_or("no window")?;
+    let clipboard = window.navigator().clipboard();
+    if clipboard.is_undefined() || clipboard.is_null() {
+        return Err("browser clipboard is unavailable (a secure context is required)".into());
+    }
+    if !js_sys::Reflect::get(&clipboard, &"write".into()).map_err(js)?.is_function() {
+        return Err("browser does not support rich clipboard writes".into());
+    }
+    let data = js_sys::Object::new();
+    for (mime, value) in [("text/html", html), ("text/plain", text)] {
+        let opts = web_sys::BlobPropertyBag::new();
+        opts.set_type(mime);
+        let parts = js_sys::Array::of1(&wasm_bindgen::JsValue::from_str(value));
+        let blob = web_sys::Blob::new_with_str_sequence_and_options(&parts, &opts).map_err(js)?;
+        js_sys::Reflect::set(&data, &mime.into(), &blob).map_err(js)?;
+    }
+    let item = web_sys::ClipboardItem::new_with_record_from_str_to_blob_promise(&data).map_err(js)?;
+    let promise = clipboard.write(&js_sys::Array::of1(&item));
+    let text = text.to_owned();
+    wasm_bindgen_futures::spawn_local(async move {
+        if let Err(e) = wasm_bindgen_futures::JsFuture::from(promise).await {
+            log::warn!("Rich clipboard write failed; trying plain text: {e:?}");
+            if let Err(e) = wasm_bindgen_futures::JsFuture::from(clipboard.write_text(&text)).await {
+                log::error!("Plain-text clipboard fallback also failed: {e:?}");
+            }
+        }
+    });
+    Ok(())
 }
 
 /// Triggers a browser download of `bytes`.
